@@ -28,26 +28,32 @@ const REPOSITORY_FILES = {
   "repository.yaml": {
     path: "repository.yaml",
     description: "Declares this folder as a Home Assistant add-on repository.",
-    content: `name: "Music Assistant Visualizer Integration"
-url: "https://github.com/example/music-assistant-visualizer"
+    content: `name: "Music Assistant Visualizer"
+url: "https://github.com/mtberrrrr1212/Music-Assistant-Lights-Sync"
 maintainer: "Home Assistant Music Visualizer Community"`
   },
   "config.yaml": {
     path: "music_assistant_visualizer/config.yaml",
     description: "Configures the Add-on name, options, permissions, and Docker architecture.",
     content: `name: "Music Assistant Visualizer"
-version: "1.2.0"
+version: "1.2.1"
 slug: "music_assistant_visualizer"
-description: "Real-time digital PCM audio analyzer and light synchronizer for Music Assistant."
-url: "https://github.com/example/music-assistant-visualizer"
+description: "High-performance digital audio visualizer. Packages a patched Music Assistant Server with real-time PCM energy analysis for Home Assistant lights."
+url: "https://github.com/mtberrrrr1212/Music-Assistant-Lights-Sync"
 arch:
   - aarch64
   - amd64
   - armv7
-init: false
+  - armhf
+startup: application
+boot: auto
 host_network: true
+ingress: true
+ingress_port: 8095
 homeassistant_api: true
 supervisor_api: true
+audio: true
+video: true
 options:
   light_entity: "light.living_room"
   update_interval: 0.1
