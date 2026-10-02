@@ -36,7 +36,7 @@ maintainer: "Home Assistant Music Visualizer Community"`
     path: "music_assistant_visualizer/config.yaml",
     description: "Configures the Add-on name, options, permissions, and Docker architecture.",
     content: `name: "Music Assistant Visualizer"
-version: "1.2.1"
+version: "1.2.3"
 slug: "music_assistant_visualizer"
 description: "High-performance digital audio visualizer. Packages a patched Music Assistant Server with real-time PCM energy analysis for Home Assistant lights."
 url: "https://github.com/mtberrrrr1212/Music-Assistant-Lights-Sync"
@@ -48,8 +48,6 @@ arch:
 startup: application
 boot: auto
 host_network: true
-ingress: true
-ingress_port: 8095
 homeassistant_api: true
 supervisor_api: true
 audio: true
@@ -74,8 +72,9 @@ schema:
   "Dockerfile": {
     path: "music_assistant_visualizer/Dockerfile",
     description: "Constructs the Docker container inheriting from the official Music Assistant Server image.",
-    content: `# Base image is the official Music Assistant Server image
-FROM ghcr.io/music-assistant/server:latest
+    content: `# Use the base image provided by the build system
+ARG BUILD_FROM
+FROM \${BUILD_FROM}
 
 # Set system shell for execution
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
