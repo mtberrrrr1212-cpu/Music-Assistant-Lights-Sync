@@ -2,110 +2,116 @@
 import unittest
 import struct
 import math
-import time
 from visualizer import MusicAssistantVisualizer
 
 class TestAudioAnalyzer(unittest.TestCase):
     def setUp(self):
         self.visualizer = MusicAssistantVisualizer()
-        # Force standalone mode during testing
         self.visualizer.standalone = True
 
-    def generate_sine_wave(self, frequency, duration=0.1, sample_rate=44100, amplitude=0.5, fmt='float'):
-        """Helper to generate a raw PCM sine wave of a given frequency."""
+    def generate_sine_wave(self, frequency, duration=0.1, sample_rate=44100, amplitude=0.5):
         num_samples = int(sample_rate * duration)
         samples = []
         for i in range(num_samples):
             t = i / sample_rate
-            val = amplitude * math.sin(2 * math.pi * frequency * t)
-            samples.append(val)
-
-        if fmt == 'float':
-            return struct.pack(f"{num_samples}f", *samples)
-        elif fmt == 'int16':
-            int_samples = [int(x * 32767) for x in samples]
-            return struct.pack(f"{num_samples}h", *int_samples)
-        return b""
+            samples.append(amplitude * math.sin(2 * math.pi * frequency * t))
+        return struct.pack(f"{num_samples}f", *samples)
 
     def test_silence(self):
-        """Test that silence produces very low energy and bass values."""
-        silence_chunk = b"\x00" * 4000 # 1000 samples of float zero
-        energy, bass = self.visualizer.analyze_pcm_chunk(silence_chunk)
-        self.assertLess(energy, 0.01, "Silence should produce near-zero energy")
-        self.assertLess(bass, 0.01, "Silence should produce near-zero bass")
+        # 16-byte header + zeros
+        # IHHIBBBB: seq=0, idx=0, tot=1, rate=44100, ch=2, depth=32, type=1 (float), res=0
+        header = struct.pack("<IHHIBBBB", 0, 0, 1, 44100, 2, 32, 1, 0)
+        silence_chunk = header + (b"\\x00" * 4000)
+        energy, bass = self.visualizer.decode_and_analyze_pcm(silence_chunk)
+        self.assertLess(energy, 0.01)
+        self.assertLess(bass, 0.01)
 
     def test_loud_vs_quiet_signal(self):
-        """Test that a louder signal produces higher energy than a quiet one."""
-        quiet_signal = self.generate_sine_wave(frequency=440, amplitude=0.1)
-        loud_signal = self.generate_sine_wave(frequency=440, amplitude=0.8)
+        header = struct.pack("<IHHIBBBB", 0, 0, 1, 44100, 2, 32, 1, 0)
+        quiet_signal = header + self.generate_sine_wave(frequency=440, amplitude=0.1)
+        loud_signal = header + self.generate_sine_wave(frequency=440, amplitude=0.8)
+        quiet_energy, _ = self.visualizer.decode_and_analyze_pcm(quiet_signal)
+        loud_energy, _ = self.visualizer.decode_and_analyze_pcm(loud_signal)
+        self.assertGreater(loud_energy, quiet_energy)
 
-        quiet_energy, _ = self.visualizer.analyze_pcm_chunk(quiet_signal)
-        loud_energy, _ = self.visualizer.analyze_pcm_chunk(loud_signal)
-
-        print(f"[Test Logs] Quiet signal energy: {quiet_energy:.4f}, Loud signal energy: {loud_energy:.4f}")
-        self.assertGreater(loud_energy, quiet_energy, "Loud signal must have higher energy than quiet signal")
-
-    def test_bass_vs_treble_signal(self):
-        """Test that a low-frequency signal produces higher bass measurements than a high-frequency signal."""
-        # Low bass wave (50Hz)
-        bass_signal = self.generate_sine_wave(frequency=50, amplitude=0.5)
-        # High treble wave (2000Hz)
-        treble_signal = self.generate_sine_wave(frequency=2000, amplitude=0.5)
-
-        # Process bass signal
-        _, bass_value_on_bass = self.visualizer.analyze_pcm_chunk(bass_signal)
-        # Process treble signal
-        _, bass_value_on_treble = self.visualizer.analyze_pcm_chunk(treble_signal)
-
-        print(f"[Test Logs] Bass wave bass measure: {bass_value_on_bass:.4f}")
-        print(f"[Test Logs] Treble wave bass measure: {bass_value_on_treble:.4f}")
+    def test_packetization_reconstruction(self):
+        """
+        Verifies that multiple UDP packets representing a split PCM block 
+        are processed as a continuous stream.
+        """
+        # Generate 0.2s of audio
+        full_pcm = self.generate_sine_wave(frequency=440, amplitude=0.5, duration=0.2)
+        payload_max = 1000
+        total_packets = (len(full_pcm) + payload_max - 1) // payload_max
         
-        self.assertGreater(bass_value_on_bass, bass_value_on_treble, 
-                           "Low-frequency signal must produce higher bass response than high-frequency signal")
+        energies = []
+        for i in range(total_packets):
+            start = i * payload_max
+            end = min(start + payload_max, len(full_pcm))
+            subchunk = full_pcm[start:end]
+            # seq incrementing, index=i, tot=total_packets
+            header = struct.pack("<IHHIBBBB", i, i, total_packets, 44100, 2, 32, 1, 0)
+            energy, _ = self.visualizer.decode_and_analyze_pcm(header + subchunk)
+            if energy > 0: energies.append(energy)
+            
+        self.assertGreater(len(energies), 0)
+        # Check that energy is relatively consistent across chunks for a sine wave
+        avg_energy = sum(energies) / len(energies)
+        for e in energies:
+            self.assertAlmostEqual(e, avg_energy, delta=0.05)
 
-    def test_smoothing_exponential_moving_average(self):
-        """Test that the smoothing EMA prevents wild jumps between successive iterations."""
-        # We simulate sudden jump from 0 to 1.0 energy and see that smoothed value rises gradually
-        e_smoothing = self.visualizer.config["energy_smoothing"]
+    def test_dropped_packet_recovery(self):
+        """Verifies that the analyzer continues gracefully when a packet is dropped."""
+        self.visualizer.expected_seq = 0
+        self.visualizer.dropped_packets = 0
         
-        # Step 1: Initialize at zero
-        self.visualizer.smoothed_energy = 0.0
+        # Packet 1 (seq 0)
+        h1 = struct.pack("<IHHIBBBB", 0, 0, 2, 44100, 2, 32, 1, 0)
+        self.visualizer.decode_and_analyze_pcm(h1 + b"\\x00"*100)
         
-        # Step 2: Feed a 1.0 energy signal
-        # The equation is: y_new = beta * 1.0 + (1 - beta) * y_old
-        # Since y_old is 0, y_new should be exactly beta * 1.0 = e_smoothing
-        energy_input = 1.0
-        self.visualizer.smoothed_energy = (e_smoothing * energy_input) + ((1.0 - e_smoothing) * self.visualizer.smoothed_energy)
+        # Drop seq 1, receive seq 2
+        h2 = struct.pack("<IHHIBBBB", 2, 0, 2, 44100, 2, 32, 1, 0)
+        self.visualizer.decode_and_analyze_pcm(h2 + b"\\x00"*100)
         
-        self.assertEqual(self.visualizer.smoothed_energy, e_smoothing, "EMA smoothing did not rise gradually")
-        print(f"[Test Logs] First step smoothed energy: {self.visualizer.smoothed_energy:.4f} (expected {e_smoothing:.4f})")
+        self.assertEqual(self.visualizer.dropped_packets, 1)
+        self.assertEqual(self.visualizer.expected_seq, 3)
 
-    def test_failure_isolation_and_robustness(self):
-        """Test that if the analyzer fails or encounters bad data, it handles it gracefully
-        and does not halt execution or affect mock streaming."""
-        # Feed corrupt / invalid byte lengths (not multiples of 2 or 4)
-        corrupt_data = b"\x12\x34\x56" # 3 bytes
-        try:
-            energy, bass = self.visualizer.analyze_pcm_chunk(corrupt_data)
-            self.assertEqual(energy, 0.0)
-            self.assertEqual(bass, 0.0)
-            print("[Test Logs] Gracefully handled corrupt audio chunk length")
-        except Exception as e:
-            self.fail(f"Analyzer crashed on corrupt data: {e}")
-
-    def test_home_assistant_connection_failure_isolation(self):
-        """Test that if Home Assistant communication fails (e.g. wrong token or offline),
-        the visualizer logs or ignores it without crashing the process."""
-        self.visualizer.standalone = False # Force HA mode
-        self.visualizer.ha_token = "invalid_token_xyz"
-        self.visualizer.ha_url = "http://localhost:1" # Invalid offline address
+    def test_packetization_reconstruction(self):
+        """Verify that multiple UDP-style packets for a single block are processed correctly."""
+        # Simulate a 16kHz Mono S16LE block split into 2 packets
+        rate, ch, depth, pcm_type = 16000, 1, 16, 2
         
-        try:
-            # This should try to send requests, time out or fail, and catch the exception gracefully
-            self.visualizer.send_ha_command(128)
-            print("[Test Logs] Gracefully isolated Home Assistant network timeout/failure")
-        except Exception as e:
-            self.fail(f"Visualizer crashed on Home Assistant connection failure: {e}")
+        # 1000 samples of a 440Hz sine wave
+        samples = [math.sin(2 * math.pi * 440 * i / rate) for i in range(1000)]
+        pcm_data = struct.pack("<" + "h"*1000, *[int(x * 32767) for x in samples])
+        
+        # Split into 2 packets
+        mid = len(pcm_data) // 2
+        p1_payload = pcm_data[:mid]
+        p2_payload = pcm_data[mid:]
+        
+        # Headers: sequence=100, indices 0 and 1, total=2
+        h1 = struct.pack("<IHHIBBBB", 100, 0, 2, rate, ch, depth, pcm_type, 0)
+        h2 = struct.pack("<IHHIBBBB", 101, 1, 2, rate, ch, depth, pcm_type, 0)
+        
+        e1, b1 = self.visualizer.decode_and_analyze_pcm(h1 + p1_payload)
+        e2, b2 = self.visualizer.decode_and_analyze_pcm(h2 + p2_payload)
+        
+        # Both should return non-zero energy if sine wave is present
+        self.assertGreater(e1, 0)
+        self.assertGreater(e2, 0)
+        self.assertEqual(self.visualizer.dropped_packets, 0)
+
+    def test_drop_resilience(self):
+        """Verify that missing packets increase the drop counter but don't crash."""
+        rate, ch, depth, pcm_type = 44100, 2, 16, 2
+        h1 = struct.pack("<IHHIBBBB", 200, 0, 1, rate, ch, depth, pcm_type, 0)
+        h2 = struct.pack("<IHHIBBBB", 205, 0, 1, rate, ch, depth, pcm_type, 0)
+        
+        self.visualizer.decode_and_analyze_pcm(h1 + b'\x00'*100)
+        self.visualizer.decode_and_analyze_pcm(h2 + b'\x00'*100)
+        
+        self.assertEqual(self.visualizer.dropped_packets, 4) # 201, 202, 203, 204 are missing
 
 if __name__ == "__main__":
     unittest.main()

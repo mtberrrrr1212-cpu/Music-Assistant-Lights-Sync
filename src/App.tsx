@@ -36,7 +36,7 @@ maintainer: "Home Assistant Music Visualizer Community"`
     path: "music_assistant_visualizer/config.yaml",
     description: "Configures the Add-on name, options, permissions, and Docker architecture.",
     content: `name: "Music Assistant Visualizer"
-version: "1.0.0"
+version: "1.2.0"
 slug: "music_assistant_visualizer"
 description: "Real-time digital PCM audio analyzer and light synchronizer for Music Assistant."
 url: "https://github.com/example/music-assistant-visualizer"
@@ -56,8 +56,6 @@ options:
   energy_smoothing: 0.15
   bass_smoothing: 0.10
   bass_boost_factor: 1.3
-  music_assistant_host: "127.0.0.1"
-  music_assistant_port: 8095
 schema:
   light_entity: str
   update_interval: float
@@ -65,9 +63,7 @@ schema:
   max_brightness: int
   energy_smoothing: float
   bass_smoothing: float
-  bass_boost_factor: float
-  music_assistant_host: str
-  music_assistant_port: int`
+  bass_boost_factor: float`
   },
   "Dockerfile": {
     path: "music_assistant_visualizer/Dockerfile",
@@ -128,7 +124,7 @@ exec mass --config /data`
   },
   "patch.py": {
     path: "music_assistant_visualizer/patch.py",
-    description: "A python utility that injects an isolated metadata-prepended UDP tap socket into Music Assistant's stdin feeding loop.",
+    description: "A python utility that injects an isolated metadata-prepended UDP tap socket into Music Assistant's stream pipes.",
     content: `#!/usr/bin/env python3
 import os
 import sys
@@ -147,16 +143,18 @@ def main():
 
     # List of possible target files where the audio data flows
     target_files = [
+        os.path.join(package_dir, "server", "controllers", "streams.py"),
+        os.path.join(package_dir, "controllers", "streams.py"),
         os.path.join(package_dir, "server", "helpers", "process.py"),
         os.path.join(package_dir, "helpers", "process.py"),
         os.path.join(package_dir, "server", "helpers", "ffmpeg.py"),
         os.path.join(package_dir, "helpers", "ffmpeg.py"),
-        os.path.join(package_dir, "server", "helpers", "audio.py"),
-        os.path.join(package_dir, "helpers", "audio.py"),
     ]
 
     patched_any = False
 
+    # The metadata-prepended non-blocking UDP socket tap code block
+    # Payload size 1200 bytes is extremely conservative for local networks
     tap_code_template = """
         # --- BEGIN MUSIC ASSISTANT VISUALIZER TAP ---
         try:
@@ -167,7 +165,7 @@ def main():
             _pcm_type = 2  # Default S16LE
             
             # Inspect object dynamically for formatting properties
-            _fmt = getattr(self, "input_format", None) or getattr(self, "audio_format", None)
+            _fmt = getattr(self, "input_format", None) or getattr(self, "audio_format", None) or getattr(self, "output_format", None)
             if _fmt:
                 _sample_rate = getattr(_fmt, "sample_rate", 44100)
                 _channels = getattr(_fmt, "channels", 2)
@@ -181,8 +179,31 @@ def main():
                     _pcm_type = 3
             
             _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            _header = struct.pack("<IBBB", _sample_rate, _channels, _bit_depth, _pcm_type)
-            _sock.sendto(_header + chunk[:32000], ("127.0.0.1", 9999))
+            _sock.setblocking(False)
+            
+            # Sequence numbering (global per process/session)
+            if not hasattr(self, "_ma_viz_seq"): self._ma_viz_seq = 0
+            
+            _payload_max = 1200
+            _total_packets = (len(chunk) + _payload_max - 1) // _payload_max
+            
+            for _i in range(_total_packets):
+                _start = _i * _payload_max
+                _end = _start + _payload_max
+                _subchunk = chunk[_start:_end]
+                
+                # Header (16 bytes):
+                # I: global sequence (4B)
+                # H: packet index (2B)
+                # H: total packets in block (2B)
+                # I: sample rate (4B)
+                # B: channels (1B)
+                # B: bit depth (1B)
+                # B: pcm type (1B)
+                # B: reserved (1B)
+                _header = struct.pack("<IHHIBBBB", self._ma_viz_seq, _i, _total_packets, _sample_rate, _channels, _bit_depth, _pcm_type, 0)
+                _sock.sendto(_header + _subchunk, ("127.0.0.1", 9999))
+                self._ma_viz_seq = (self._ma_viz_seq + 1) % 0xFFFFFFFF
         except Exception:
             pass
         # --- END MUSIC ASSISTANT VISUALIZER TAP ---
@@ -233,7 +254,7 @@ if __name__ == "__main__":
   },
   "visualizer.py": {
     path: "music_assistant_visualizer/visualizer.py",
-    description: "The main background daemon. Automatically decodes PCM streams using C-optimized standard libraries and includes real-time telemetry diagnostics.",
+    description: "The main background daemon. Analyzes incoming UDP PCM packets, extracts energy/bass, and syncs with Home Assistant.",
     content: `#!/usr/bin/env python3
 import os
 import sys
@@ -242,7 +263,7 @@ import socket
 import struct
 import array
 import time
-import requests
+import urllib.request
 import threading
 import math
 
@@ -254,23 +275,33 @@ class MusicAssistantVisualizer:
         self.udp_port = 9999
         self.running = True
         
+        # Audio Analysis State
         self.current_energy = 0.0
         self.current_bass = 0.0
         self.lpf_state = 0.0
         self.lpf_alpha = 0.02
         self.smoothed_energy = 0.0
         self.smoothed_bass = 0.0
-        self.last_ha_update = 0
-        self.last_brightness = -1
-        self.is_playing = False
-        self.last_audio_received = 0
         
+        # Stream Continuity State
+        self.expected_seq = -1
+        self.last_audio_received = 0
+        self.is_playing = False
+        
+        # Diagnostics
         self.packets_sec = 0
         self.bytes_sec = 0
         self.analyzer_errors = 0
+        self.dropped_packets = 0
         self.last_diagnostic_print = 0
         self.last_header_info = "Unknown"
+        self.current_duration_ms = 0.0
         
+        # Throttling
+        self.last_ha_update = 0
+        self.last_brightness = -1
+        
+        # Setup Home Assistant headers
         self.ha_token = os.environ.get("SUPERVISOR_TOKEN", "")
         self.ha_url = "http://supervisor/core/api"
         self.standalone = self.diagnostic_mode or not self.ha_token
@@ -293,185 +324,171 @@ class MusicAssistantVisualizer:
             except Exception:
                 pass
 
-    def send_ha_command(self, brightness):
-        if self.standalone:
-            return
-        url = f"{self.ha_url}/services/light/turn_on"
-        headers = {"Authorization": f"Bearer {self.ha_token}", "Content-Type": "application/json"}
-        payload = {"entity_id": self.config["light_entity"], "brightness": int(brightness)}
+    def send_ha_request(self, endpoint, payload):
+        """Sends service call to Home Assistant using standard library urllib (local network only)."""
+        if self.standalone: return
+        
+        url = f"{self.ha_url}/services/light/{endpoint}"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Authorization", f"Bearer {self.ha_token}")
+        req.add_header("Content-Type", "application/json")
+        
         try:
-            requests.post(url, headers=headers, json=payload, timeout=0.15)
+            with urllib.request.urlopen(req, timeout=0.15) as response:
+                pass
         except Exception:
             pass
+
+    def send_ha_command(self, brightness):
+        self.send_ha_request("turn_on", {
+            "entity_id": self.config["light_entity"],
+            "brightness": int(brightness)
+        })
 
     def turn_off_light(self):
-        if self.standalone:
-            return
-        url = f"{self.ha_url}/services/light/turn_off"
-        headers = {"Authorization": f"Bearer {self.ha_token}", "Content-Type": "application/json"}
-        payload = {"entity_id": self.config["light_entity"]}
-        try:
-            requests.post(url, headers=headers, json=payload, timeout=0.2)
-        except Exception:
-            pass
+        self.send_ha_request("turn_off", {
+            "entity_id": self.config["light_entity"]
+        })
 
     def decode_and_analyze_pcm(self, data):
-        if len(data) < 7:
+        if len(data) < 16:
             self.analyzer_errors += 1
             return 0.0, 0.0
         try:
-            sample_rate, channels, bit_depth, pcm_type = struct.unpack("<IBBB", data[:7])
-            payload = data[7:]
-            self.last_header_info = f"{'F32LE' if pcm_type==1 else 'S16LE' if pcm_type==2 else 'S24LE'} | {sample_rate}Hz | {channels}ch"
+            seq, idx, total, rate, ch, depth, pcm_type, _ = struct.unpack("<IHHIBBBB", data[:16])
+            payload = data[16:]
             
-            # Recalculate low-pass filter alpha based on true sample_rate
+            # Sequence Tracking
+            if self.expected_seq != -1:
+                gap = (seq - self.expected_seq) % 0xFFFFFFFF
+                if gap > 0: self.dropped_packets += gap
+            self.expected_seq = (seq + 1) % 0xFFFFFFFF
+            
+            # Dynamic Duration Logic
+            self.last_header_info = f"{'F32LE' if pcm_type==1 else 'S16LE' if pcm_type==2 else 'S24LE'} | {rate}Hz | {ch}ch"
+            bytes_per_sample = max(1, depth // 8)
+            bytes_per_frame = ch * bytes_per_sample
+            if rate > 0 and bytes_per_frame > 0:
+                self.current_duration_ms = (len(payload) / (rate * bytes_per_frame)) * 1000.0
+
+            # Cutoff 150Hz
             fc = 150.0
-            dt = 1.0 / max(sample_rate, 8000)
+            dt = 1.0 / max(rate, 8000)
             rc = 1.0 / (2.0 * math.pi * fc)
             self.lpf_alpha = dt / (rc + dt)
 
             samples = []
             if pcm_type == 1:
-                num_floats = len(payload) // 4
-                if num_floats > 0:
-                    samples_arr = array.array('f')
-                    samples_arr.frombytes(payload[:num_floats * 4])
-                    samples = list(samples_arr)
+                num = len(payload) // 4
+                if num > 0:
+                    arr = array.array('f')
+                    arr.frombytes(payload[:num*4])
+                    samples = list(arr)
             elif pcm_type == 2:
-                num_shorts = len(payload) // 2
-                if num_shorts > 0:
-                    shorts_arr = array.array('h')
-                    shorts_arr.frombytes(payload[:num_shorts * 2])
-                    samples = [x / 32768.0 for x in shorts_arr]
+                num = len(payload) // 2
+                if num > 0:
+                    arr = array.array('h')
+                    arr.frombytes(payload[:num*2])
+                    samples = [x / 32768.0 for x in arr]
             elif pcm_type == 3:
-                num_samples = len(payload) // 3
-                for i in range(num_samples):
-                    slice_3 = payload[i*3 : (i+1)*3]
-                    sign_byte = b'\\xff' if slice_3[2] & 0x80 else b'\\x00'
-                    val = struct.unpack("<i", slice_3 + sign_byte)[0]
+                num = len(payload) // 3
+                for i in range(num):
+                    s = payload[i*3 : (i+1)*3]
+                    sb = b'\\\\xff' if s[2] & 0x80 else b'\\\\x00'
+                    val = struct.unpack("<i", s + sb)[0]
                     samples.append(val / 8388608.0)
-            else:
-                self.analyzer_errors += 1
-                return 0.0, 0.0
+            
+            if not samples: return 0.0, 0.0
 
-            if not samples:
-                return 0.0, 0.0
-
-            sum_squares = sum(x * x for x in samples)
-            rms = math.sqrt(sum_squares / len(samples))
+            # RMS Energy
+            rms = math.sqrt(sum(x*x for x in samples) / len(samples))
             energy = min(rms * 2.5, 1.0)
 
-            # Apply IIR filter for Bass extraction
+            # LPF Bass
             bass_samples = []
             for x in samples:
                 self.lpf_state = self.lpf_alpha * x + (1.0 - self.lpf_alpha) * self.lpf_state
                 bass_samples.append(self.lpf_state)
-                
-            sum_bass_squares = sum(x * x for x in bass_samples)
-            bass_rms = math.sqrt(sum_bass_squares / len(bass_samples))
+            
+            bass_rms = math.sqrt(sum(x*x for x in bass_samples) / len(bass_samples))
             bass = min(bass_rms * 3.5 * self.config["bass_boost_factor"], 1.0)
             return energy, bass
-
         except Exception:
             self.analyzer_errors += 1
             return 0.0, 0.0
 
-    def print_diagnostics_report(self):
+    def print_diagnostics(self):
         now = time.time()
         if now - self.last_diagnostic_print >= 1.0:
-            status_str = "ACTIVE PLAYBACK" if self.is_playing else "STANDBY"
-            print("\\n" + "="*50)
+            status = "ACTIVE" if self.is_playing else "STANDBY"
+            print("\\\\n" + "="*50)
             print("         MUSIC ASSISTANT AUDIO TAP DIAGNOSTICS      ")
             print("="*50)
-            print(f"Tap Status:             {status_str}")
-            print(f"Detected Audio Stream:  {self.last_header_info}")
-            print(f"Packets received / sec: {self.packets_sec} pkts")
-            print(f"Data received rate:     {self.bytes_sec / 1024:.2f} KB/s")
-            print(f"Calculated Energy (RMS):{self.current_energy:.4f} (Smoothed: {self.smoothed_energy:.4f})")
-            print(f"Calculated Bass (LPF):  {self.current_bass:.4f} (Smoothed: {self.smoothed_bass:.4f})")
-            print(f"Analyzer Errors:        {self.analyzer_errors} errors")
+            print(f"Status:             {status}")
+            print(f"Stream:             {self.last_header_info}")
+            print(f"Packet Duration:    {self.current_duration_ms:.2f} ms")
+            print(f"Packets/sec:        {self.packets_sec}")
+            print(f"Dropped Packets:    {self.dropped_packets}")
+            print(f"Energy (RMS):       {self.current_energy:.4f} (Smoothed: {self.smoothed_energy:.4f})")
+            print(f"Bass (LPF):         {self.current_bass:.4f} (Smoothed: {self.smoothed_bass:.4f})")
+            print(f"Errors:             {self.analyzer_errors}")
             print("="*50)
-            self.packets_sec = 0
-            self.bytes_sec = 0
+            self.packets_sec = self.bytes_sec = 0
             self.last_diagnostic_print = now
 
-    def playback_monitor_thread(self):
+    def playback_monitor(self):
         while self.running:
             time.sleep(1.0)
-            now = time.time()
-            if self.is_playing and (now - self.last_audio_received > 3.0):
+            if self.is_playing and (time.time() - self.last_audio_received > 3.0):
                 self.is_playing = False
                 self.turn_off_light()
-                self.smoothed_energy = 0.0
-                self.smoothed_bass = 0.0
-                self.last_brightness = -1
+                self.smoothed_energy = self.smoothed_bass = 0.0
+                self.expected_seq = -1
 
     def listen_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.bind((self.udp_host, self.udp_port))
-        except Exception:
-            self.running = False
-            return
+        try: sock.bind((self.udp_host, self.udp_port))
+        except Exception: self.running = False; return
         sock.settimeout(0.5)
-        monitor = threading.Thread(target=self.playback_monitor_thread, daemon=True)
-        monitor.start()
+        threading.Thread(target=self.playback_monitor, daemon=True).start()
         self.last_diagnostic_print = time.time()
-
         while self.running:
             try:
-                data, addr = sock.recvfrom(65535)
+                data, _ = sock.recvfrom(2048)
                 self.last_audio_received = time.time()
                 self.packets_sec += 1
                 self.bytes_sec += len(data)
-                
-                if not self.is_playing:
-                    self.is_playing = True
-
+                if not self.is_playing: self.is_playing = True
                 energy, bass = self.decode_and_analyze_pcm(data)
-                self.current_energy = energy
-                self.current_bass = bass
-                
-                e_smoothing = self.config["energy_smoothing"]
-                b_smoothing = self.config["bass_smoothing"]
-                self.smoothed_energy = (e_smoothing * energy) + ((1.0 - e_smoothing) * self.smoothed_energy)
-                self.smoothed_bass = (b_smoothing * bass) + ((1.0 - b_smoothing) * self.smoothed_bass)
-                
-                if self.diagnostic_mode:
-                    self.print_diagnostics_report()
-                    continue
-                
+                self.current_energy, self.current_bass = energy, bass
+                es, bs = self.config["energy_smoothing"], self.config["bass_smoothing"]
+                self.smoothed_energy = (es * energy) + ((1.0 - es) * self.smoothed_energy)
+                self.smoothed_bass = (bs * bass) + ((1.0 - bs) * self.smoothed_bass)
+                if self.diagnostic_mode: self.print_diagnostics(); continue
                 now = time.time()
                 if now - self.last_ha_update >= self.config["update_interval"]:
-                    min_b = self.config["min_brightness"]
-                    max_b = self.config["max_brightness"]
-                    combined_energy = max(self.smoothed_energy, self.smoothed_bass * 0.8)
-                    brightness = int(min_b + (combined_energy * (max_b - min_b)))
-                    brightness = max(min_b, min(brightness, max_b))
-                    
-                    if abs(brightness - self.last_brightness) >= 3 or (brightness == min_b and self.last_brightness != min_b):
-                        self.send_ha_command(brightness)
-                        self.last_brightness = brightness
+                    min_b, max_b = self.config["min_brightness"], self.config["max_brightness"]
+                    val = max(self.smoothed_energy, self.smoothed_bass * 0.8)
+                    bri = int(min_b + (val * (max_b - min_b)))
+                    bri = max(min_b, min(bri, max_b))
+                    if abs(bri - self.last_brightness) >= 3 or (bri == min_b and self.last_brightness != min_b):
+                        self.send_ha_command(bri); self.last_brightness = bri
                     self.last_ha_update = now
             except socket.timeout:
-                if self.diagnostic_mode:
-                    self.print_diagnostics_report()
-            except Exception:
-                self.analyzer_errors += 1
-                time.sleep(0.5)
+                if self.diagnostic_mode: self.print_diagnostics()
+            except Exception: self.analyzer_errors += 1; time.sleep(0.5)
         sock.close()
 
 if __name__ == "__main__":
     is_diag = "--diagnostic" in sys.argv
     visualizer = MusicAssistantVisualizer(diagnostic_mode=is_diag)
-    try:
-        visualizer.listen_loop()
-    except KeyboardInterrupt:
-        visualizer.running = False`
+    try: visualizer.listen_loop()
+    except KeyboardInterrupt: visualizer.running = False`
   },
   "test_analyzer.py": {
     path: "music_assistant_visualizer/test_analyzer.py",
-    description: "Automated unit test suite verifying silence, signal levels, filters, smoothing, and isolation capabilities.",
+    description: "Automated unit test suite verifying silence, signal levels, filters, smoothing, and packet reconstruction.",
     content: `#!/usr/bin/env python3
 import unittest
 import struct
@@ -492,20 +509,111 @@ class TestAudioAnalyzer(unittest.TestCase):
         return struct.pack(f"{num_samples}f", *samples)
 
     def test_silence(self):
-        silence_chunk = b"\\x00" * 4007
+        header = struct.pack("<IHHIBBBB", 0, 0, 1, 44100, 2, 32, 1, 0)
+        silence_chunk = header + (b"\\\\x00" * 4000)
         energy, bass = self.visualizer.decode_and_analyze_pcm(silence_chunk)
         self.assertLess(energy, 0.01)
         self.assertLess(bass, 0.01)
 
     def test_loud_vs_quiet_signal(self):
-        quiet_signal = b"\\x44\\xac\\x00\\x00\\x02\\x10\\x01" + self.generate_sine_wave(frequency=440, amplitude=0.1)
-        loud_signal = b"\\x44\\xac\\x00\\x00\\x02\\x10\\x01" + self.generate_sine_wave(frequency=440, amplitude=0.8)
+        header = struct.pack("<IHHIBBBB", 0, 0, 1, 44100, 2, 32, 1, 0)
+        quiet_signal = header + self.generate_sine_wave(frequency=440, amplitude=0.1)
+        loud_signal = header + self.generate_sine_wave(frequency=440, amplitude=0.8)
         quiet_energy, _ = self.visualizer.decode_and_analyze_pcm(quiet_signal)
         loud_energy, _ = self.visualizer.decode_and_analyze_pcm(loud_signal)
         self.assertGreater(loud_energy, quiet_energy)
 
+    def test_packetization_reconstruction(self):
+        full_pcm = self.generate_sine_wave(frequency=440, amplitude=0.5, duration=0.2)
+        payload_max = 1000
+        total_packets = (len(full_pcm) + payload_max - 1) // payload_max
+        energies = []
+        for i in range(total_packets):
+            start = i * payload_max
+            end = min(start + payload_max, len(full_pcm))
+            subchunk = full_pcm[start:end]
+            header = struct.pack("<IHHIBBBB", i, i, total_packets, 44100, 2, 32, 1, 0)
+            energy, _ = self.visualizer.decode_and_analyze_pcm(header + subchunk)
+            if energy > 0: energies.append(energy)
+        self.assertGreater(len(energies), 0)
+        avg_energy = sum(energies) / len(energies)
+        for e in energies:
+            self.assertAlmostEqual(e, avg_energy, delta=0.05)
+
+    def test_dropped_packet_recovery(self):
+        self.visualizer.expected_seq = 0
+        self.visualizer.dropped_packets = 0
+        h1 = struct.pack("<IHHIBBBB", 0, 0, 2, 44100, 2, 32, 1, 0)
+        self.visualizer.decode_and_analyze_pcm(h1 + b"\\\\x00"*100)
+        h2 = struct.pack("<IHHIBBBB", 2, 0, 2, 44100, 2, 32, 1, 0)
+        self.visualizer.decode_and_analyze_pcm(h2 + b"\\\\x00"*100)
+        self.assertEqual(self.visualizer.dropped_packets, 1)
+        self.assertEqual(self.visualizer.expected_seq, 3)
+
 if __name__ == "__main__":
     unittest.main()`
+  },
+  "README.md": {
+    path: "music_assistant_visualizer/README.md",
+    description: "Detailed setup instructions, architecture breakdown, and performance notes.",
+    content: `# Music Assistant Visualizer (Visualizer Edition)
+
+Synchronize your smart home lighting to the digital audio being played by Music Assistant in real-time. 
+
+## ⚠️ Important Architecture Note
+
+This application is packaged as a **replacement for the official Music Assistant Add-on**. 
+
+**Why a replacement?**
+To achieve zero-latency, high-fidelity audio synchronization, the visualizer must tap into Music Assistant's internal FFmpeg playback pipes. Because Home Assistant Add-ons are isolated containers, this tap can only be performed by running the visualizer inside the same container as the Music Assistant server.
+
+**Benefits:**
+*   **One Server:** You do not run two copies of Music Assistant.
+*   **Universal Tap:** Works for all players and all providers automatically.
+*   **Zero Latency:** Audio analysis happens in memory before it even leaves the server.
+
+## 🚀 Installation Steps
+
+1.  **Backup:** Open Home Assistant -> Settings -> System -> Backups. Create a full backup (including the official Music Assistant Add-on data).
+2.  **Stop Official Add-on:** Go to Settings -> Add-ons -> Music Assistant and click **Stop**.
+3.  **Add Repository:**
+    *   Go to Settings -> Add-ons -> Add-on Store.
+    *   Click the three dots (top right) -> **Repositories**.
+    *   Add the URL of this repository.
+4.  **Install:** Find "Music Assistant Visualizer" in the store and click **Install**.
+5.  **Configuration:** 
+    *   Go to the **Configuration** tab.
+    *   Set your \`light_entity\` (e.g., \`light.living_room_strip\`).
+    *   Click **Save**.
+6.  **Start:** Click **Start**.
+7.  **Migration:** Start the Add-on, open its Web UI, and use the **Backup/Restore** feature to import your previously saved configuration.
+
+## 📊 Technical Documentation: Audio Analysis
+
+### Dynamic PCM Handling
+The system dynamically calculates analysis windows based on the actual PCM format being played. The relationship is:
+
+\`Analysis Window (ms) = (Bytes Received / (Sample Rate * Channels * (Bit Depth / 8))) * 1000\`
+
+For a standard 44.1kHz 16-bit Stereo stream:
+*   1024 bytes ≈ 5.8 ms
+*   32 KB ≈ 185.7 ms
+
+The visualizer supports:
+*   **S16LE (16-bit):** Standard quality.
+*   **S24LE (24-bit):** High-fidelity.
+*   **F32LE (Float):** Internal processing format.
+
+### Performance & Safety
+*   **UDP Tap:** The audio tap uses non-blocking UDP on \`127.0.0.1\`. If the visualizer crashes or the socket buffer fills, the tap drops packets instantly. **Music playback is never interrupted.**
+*   **Lightweight:** Uses Python's \`struct\` and \`array\` for bare-metal performance. No heavy dependencies like NumPy.
+*   **LAN Safety:** UDP datagrams are capped at 1200 bytes to avoid IP fragmentation and ensure compatibility with all network hardware.
+
+## 🛠️ Testing
+Run the automated test suite to verify the analyzer logic:
+\`\`\`bash
+python3 test_analyzer.py
+\`\`\``
   }
 };
 

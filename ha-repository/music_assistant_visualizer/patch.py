@@ -16,20 +16,18 @@ def main():
 
     # List of possible target files where the audio data flows
     target_files = [
-        # Process helper where the AsyncProcess feeds stdin
+        os.path.join(package_dir, "server", "controllers", "streams.py"),
+        os.path.join(package_dir, "controllers", "streams.py"),
         os.path.join(package_dir, "server", "helpers", "process.py"),
         os.path.join(package_dir, "helpers", "process.py"),
-        # FFMpeg wrapper class
         os.path.join(package_dir, "server", "helpers", "ffmpeg.py"),
         os.path.join(package_dir, "helpers", "ffmpeg.py"),
-        # Audio processing generator helpers
-        os.path.join(package_dir, "server", "helpers", "audio.py"),
-        os.path.join(package_dir, "helpers", "audio.py"),
     ]
 
     patched_any = False
 
     # The metadata-prepended non-blocking UDP socket tap code block
+    # Payload size 1200 bytes is extremely conservative for local networks
     tap_code_template = """
         # --- BEGIN MUSIC ASSISTANT VISUALIZER TAP ---
         try:
@@ -40,7 +38,7 @@ def main():
             _pcm_type = 2  # Default S16LE
             
             # Inspect object dynamically for formatting properties
-            _fmt = getattr(self, "input_format", None) or getattr(self, "audio_format", None)
+            _fmt = getattr(self, "input_format", None) or getattr(self, "audio_format", None) or getattr(self, "output_format", None)
             if _fmt:
                 _sample_rate = getattr(_fmt, "sample_rate", 44100)
                 _channels = getattr(_fmt, "channels", 2)
@@ -54,9 +52,31 @@ def main():
                     _pcm_type = 3
             
             _sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            _header = struct.pack("<IBBB", _sample_rate, _channels, _bit_depth, _pcm_type)
-            # Limit UDP packet payload to 32000 bytes to prevent OS transmission exceptions
-            _sock.sendto(_header + chunk[:32000], ("127.0.0.1", 9999))
+            _sock.setblocking(False)
+            
+            # Sequence numbering (global per process/session)
+            if not hasattr(self, "_ma_viz_seq"): self._ma_viz_seq = 0
+            
+            _payload_max = 1200
+            _total_packets = (len(chunk) + _payload_max - 1) // _payload_max
+            
+            for _i in range(_total_packets):
+                _start = _i * _payload_max
+                _end = _start + _payload_max
+                _subchunk = chunk[_start:_end]
+                
+                # Header (16 bytes):
+                # I: global sequence (4B)
+                # H: packet index (2B)
+                # H: total packets in block (2B)
+                # I: sample rate (4B)
+                # B: channels (1B)
+                # B: bit depth (1B)
+                # B: pcm type (1B)
+                # B: reserved (1B)
+                _header = struct.pack("<IHHIBBBB", self._ma_viz_seq, _i, _total_packets, _sample_rate, _channels, _bit_depth, _pcm_type, 0)
+                _sock.sendto(_header + _subchunk, ("127.0.0.1", 9999))
+                self._ma_viz_seq = (self._ma_viz_seq + 1) % 0xFFFFFFFF
         except Exception:
             pass
         # --- END MUSIC ASSISTANT VISUALIZER TAP ---
@@ -71,16 +91,13 @@ def main():
         with open(target_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Check if already patched
         if "MUSIC ASSISTANT VISUALIZER TAP" in content:
             print(f"Already patched! Skipping: {target_path}")
             patched_any = True
             continue
 
-        # Pattern 1: Feed stdin loop inside AsyncProcess / ffmpeg wrappers
         target_pattern = "async for chunk in self.audio_input:"
         if target_pattern in content:
-            # We insert our tap code block right after the loop statement
             replacement = f"{target_pattern}{tap_code_template}"
             content = content.replace(target_pattern, replacement)
             with open(target_path, "w", encoding="utf-8") as f:
@@ -89,7 +106,6 @@ def main():
             patched_any = True
             continue
 
-        # Pattern 2: Audio input loop where self isn't used
         target_pattern_alt = "async for chunk in audio_input:"
         if target_pattern_alt in content:
             replacement = f"{target_pattern_alt}{tap_code_template.replace('self', 'None')}"
@@ -100,21 +116,10 @@ def main():
             patched_any = True
             continue
 
-        # Pattern 3: Standard yield chunk fallback inside audio.py
-        target_yield = "        yield chunk"
-        if target_yield in content and ("audio" in target_path or "ffmpeg" in target_path):
-            replacement = f"{tap_code_template.replace('self', 'None')}\n        yield chunk"
-            content = content.replace(target_yield, replacement)
-            with open(target_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            print(f"Successfully patched yield fallback in: {target_path}")
-            patched_any = True
-            continue
-
     if patched_any:
-        print("Music Assistant codebase patched successfully! Audio flow will tap directly to Visualizer.")
+        print("Music Assistant codebase patched successfully!")
     else:
-        print("Error: Could not locate a secure audio tap injection point in any Music Assistant helper files.")
+        print("Error: Could not locate a secure audio tap injection point.")
         sys.exit(1)
 
 if __name__ == "__main__":

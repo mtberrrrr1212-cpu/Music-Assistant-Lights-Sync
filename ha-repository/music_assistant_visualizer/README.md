@@ -18,39 +18,52 @@ This Add-on functions as a direct digital bridge between Music Assistant's raw P
 
 ---
 
-## 3. Installation
+## 3. Installation & Architecture
 
-Because a safe digital audio tap requires intercepting the raw PCM stream inside Music Assistant, this App is packaged as a modified Music Assistant Server. It preserves all of your databases and settings, but adds the high-speed background tap.
+To tap into the real-time digital audio pipeline with zero latency, this application is packaged as a **replacement for the official Music Assistant Add-on**. It uses the exact same base code but inserts an isolated analysis bridge.
 
-### Step-by-Step UI Instructions:
+**IMPORTANT: Do NOT run two Music Assistant servers simultaneously.**
 
-1. **Back up your current Music Assistant config**:
-   * Navigate to **Settings** → **System** → **Backups**.
-   * Click **Create Backup**, select a custom name (e.g., "Music Assistant Pre-Visualizer"), and make sure the "Music Assistant" folder is selected. Click Create.
-2. **Stop and disable the official Music Assistant Server**:
-   * Go to **Settings** → **Add-ons** (or **Apps**) → **Music Assistant**.
+### Recommended Migration Path:
+
+1. **Back up your current configuration**:
+   * Open **Music Assistant**.
+   * Go to **Settings** → **Server** → **Backup/Restore**.
+   * Perform a full backup of your providers and settings.
+2. **Stop the official Add-on**:
+   * Navigate to **Settings** → **Add-ons** → **Music Assistant**.
    * Toggle off **Start on boot** and click **Stop**.
-3. **Add the Custom Repository**:
-   * Go to **Settings** → **Apps** (or **Add-ons**) → **Install app** (or **Add-on Store**).
-   * In the top-right corner, click the three-dots menu (**⋮**) and choose **Repositories**.
-   * Copy the URL of your customized GitHub repository and paste it into the field, then click **Add** and close the dialog.
-4. **Install the Visualizer App**:
-   * Scroll down or search the Store to locate the new card named **Music Assistant Visualizer**.
-   * Click on it and select **Install** (this may take a couple of minutes to build the secure container on your hardware).
+3. **Add this Repository**:
+   * Go to **Settings** → **Add-ons** → **Add-on Store**.
+   * In the top-right menu (⋮), select **Repositories**.
+   * Add: `https://github.com/example/music-assistant-visualizer`
+4. **Install the Visualizer Version**:
+   * Find **Music Assistant Visualizer** in the store.
+   * Click **Install**. This will build the container on your hardware.
+5. **Restore your data (if needed)**:
+   * Since this is a new Add-on instance, it has a separate data folder.
+   * Start the Add-on, open its Web UI, and use the **Backup/Restore** feature to import your previously saved configuration.
+   * Alternatively, most users find that simply re-logging into their streaming providers takes only a few seconds.
 
 ---
 
 ## 4. Configuration
 
-Once the installation completes, configure the visualizer under the **Configuration** tab in the App's panel:
+1. Go to the **Configuration** tab in the Add-on panel.
+2. **Light Entity**: The exact ID (e.g. `light.living_room_strip`).
+3. **Update Interval**: Default `0.1` (10Hz). Increase to `0.2` if your Zigbee network is unstable.
+4. **Energy/Bass Smoothing**: Fine-tune how "snappy" or "smooth" the lights react.
+5. Click **Save** and **Start**.
 
-1. **Light Entity**: Enter the exact entity ID of the light you want to synchronize (e.g., `light.living_room_strip` or `light.ceiling_bulb`).
-2. **Min Brightness**: Set the minimum brightness level (e.g., `10` or `15`) so the room does not go completely black during silent moments.
-3. **Max Brightness**: Set the maximum allowed brightness (e.g., `255` for full range).
-4. **Update Interval**: The speed of updates in seconds. Default is `0.1` (10 updates per second) which is optimal for smoothness without overloading your Zigbee/Wi-Fi hub.
-5. **Energy & Bass Smoothing**: Lower values (e.g. `0.1`) make the transitions smoother and slower, while higher values (e.g. `0.3`) make the reactions faster and punchier.
-6. **Start on Boot**: Enable this toggle.
-7. Click **Save** and then click **Start** on the Info page.
+---
+
+## 5. Architecture Verification
+
+This installation ensures:
+1. **Single Instance**: Only one `mass` process runs on port 8095.
+2. **True Digital Tap**: The visualizer patches the `_feed_stdin` loop in the active `ffmpeg` pipeline. It sees the exact PCM data that travels to your speakers.
+3. **Complete Isolation**: The visualizer daemon runs as a child process. If it crashes, `mass` continues playing music without interruption.
+4. **Zero Cloud Dependencies**: All analysis and Home Assistant communication stays on your local network. No audio is recorded or sent to external servers.
 
 ---
 
@@ -118,5 +131,6 @@ Once the installation completes, configure the visualizer under the **Configurat
 ```
 
 ### Safety & Isolation Guarantees:
-* **Zero Playback Interruption**: The audio tap uses a local UDP sender inside a standard try/except block. If the visualizer daemon crashes or stops, UDP packets are instantly dropped by the kernel with zero overhead. There are no blocking locks or queues, meaning music playback will never crackle, lag, or stop.
-* **Low Network Overhead**: Updates are throttled at `0.1s` intervals and filtered with a deadband threshold so that Home Assistant is only notified when a noticeable brightness change occurs. This prevents flooding Zigbee, Z-Wave, or Wi-Fi smart plugs.
+* **Zero Playback Interruption**: The audio tap uses a non-blocking UDP sender. Chunks are split into small datagrams (< 1500 bytes) to avoid IP fragmentation. If the visualizer daemon crashes or stops, UDP packets are dropped instantly with zero overhead.
+* **Dynamic Analysis**: The analyzer calculates audio duration and filter coefficients dynamically using the embedded PCM metadata (Sample Rate, Bit Depth, Channels). It reconstructs the continuous stream by tracking packet sequence numbers and handles dropped packets gracefully without blocking.
+* **Low Network Overhead**: Light updates are throttled (default 100ms) and use a deadband threshold to prevent Zigbee/Wi-Fi congestion.

@@ -1,7 +1,7 @@
 name: "Music Assistant Visualizer"
-version: "1.0.0"
+version: "1.2.0"
 slug: "music_assistant_visualizer"
-description: "Real-time digital PCM audio analyzer and light synchronizer for Music Assistant."
+description: "High-performance digital audio visualizer. Packages a patched Music Assistant Server with real-time PCM energy analysis for Home Assistant lights."
 url: "https://github.com/example/music-assistant-visualizer"
 arch:
   - aarch64
@@ -11,6 +11,12 @@ init: false
 host_network: true
 homeassistant_api: true
 supervisor_api: true
+audio: true
+video: true
+network: true
+ports:
+  8095/tcp: 8095
+  8097/tcp: 8097
 options:
   light_entity: "light.living_room"
   update_interval: 0.1
@@ -19,8 +25,6 @@ options:
   energy_smoothing: 0.15
   bass_smoothing: 0.10
   bass_boost_factor: 1.3
-  music_assistant_host: "127.0.0.1"
-  music_assistant_port: 8095
 schema:
   light_entity: str
   update_interval: float
@@ -29,5 +33,3 @@ schema:
   energy_smoothing: float
   bass_smoothing: float
   bass_boost_factor: float
-  music_assistant_host: str
-  music_assistant_port: int
