@@ -1,0 +1,6 @@
+{
+  "name": "Music Assistant to Home Assistant Lights Visualizer",
+  "description": "An interactive MVP dashboard, simulator, and addon repository for synchronizing Home Assistant lights to the digital audio currently being played by Music Assistant.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
