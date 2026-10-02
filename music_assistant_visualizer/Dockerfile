@@ -1,9 +1,13 @@
-# Use the base image provided by the build system
-ARG BUILD_FROM
-FROM ${BUILD_FROM}
+FROM ghcr.io/music-assistant/server:stable
 
 # Set system shell for execution
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Add Home Assistant Labels
+LABEL \
+  io.hass.name="Music Assistant Visualizer" \
+  io.hass.description="High-performance digital audio visualizer for Music Assistant" \
+  io.hass.type="addon"
 
 # Create application directory
 RUN mkdir -p /app

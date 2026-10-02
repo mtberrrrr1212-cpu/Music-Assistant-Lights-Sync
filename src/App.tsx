@@ -43,8 +43,6 @@ url: "https://github.com/mtberrrrr1212/Music-Assistant-Lights-Sync"
 arch:
   - aarch64
   - amd64
-  - armv7
-  - armhf
 startup: application
 boot: auto
 host_network: true
@@ -72,12 +70,16 @@ schema:
   "Dockerfile": {
     path: "music_assistant_visualizer/Dockerfile",
     description: "Constructs the Docker container inheriting from the official Music Assistant Server image.",
-    content: `# Use the base image provided by the build system
-ARG BUILD_FROM
-FROM \${BUILD_FROM}
+    content: `FROM ghcr.io/music-assistant/server:stable
 
 # Set system shell for execution
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Add Home Assistant Labels
+LABEL \\
+  io.hass.name="Music Assistant Visualizer" \\
+  io.hass.description="High-performance digital audio visualizer for Music Assistant" \\
+  io.hass.type="addon"
 
 # Create application directory
 RUN mkdir -p /app
